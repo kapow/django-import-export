@@ -11,7 +11,7 @@ import django
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.management.color import no_style
-from django.db import DEFAULT_DB_ALIAS, connections
+from django.db import connections, router, transaction, DEFAULT_DB_ALIAS
 from django.db.models.fields.related import ForeignObjectRel
 from django.db.models.query import QuerySet
 from django.db.transaction import (
@@ -317,7 +317,8 @@ class Resource(metaclass=DeclarativeMetaclass):
             # we don't have transactions and we want to do a dry_run
             pass
         else:
-            instance.save()
+            with atomic_if_using_transaction(using_transactions, using=self.get_connection_name()):
+                instance.save()
         self.after_save_instance(instance, using_transactions, dry_run)
 
     def before_save_instance(self, instance, using_transactions, dry_run):
@@ -476,6 +477,12 @@ class Resource(metaclass=DeclarativeMetaclass):
         """
         pass
 
+    def get_connection_name(self):
+        """
+        Connection name to perform transactions on. Returns "default" by default.
+        """
+        return DEFAULT_DB_ALIAS
+
     def import_row(self, row, instance_loader, using_transactions=True, dry_run=False, **kwargs):
         """
         Imports data from ``tablib.Dataset``. Refer to :doc:`import_workflow`
@@ -571,7 +578,7 @@ class Resource(metaclass=DeclarativeMetaclass):
         if use_transactions is None:
             use_transactions = self.get_use_transactions()
 
-        connection = connections[DEFAULT_DB_ALIAS]
+        connection = connections[self.get_connection_name()]
         supports_transactions = getattr(connection.features, "supports_transactions", False)
 
         if use_transactions and not supports_transactions:
@@ -579,7 +586,7 @@ class Resource(metaclass=DeclarativeMetaclass):
 
         using_transactions = (use_transactions or dry_run) and supports_transactions
 
-        with atomic_if_using_transaction(using_transactions):
+        with atomic_if_using_transaction(using_transactions, using=self.get_connection_name()):
             return self.import_data_inner(dataset, dry_run, raise_errors, using_transactions, collect_failed_rows, **kwargs)
 
     def import_data_inner(self, dataset, dry_run, raise_errors, using_transactions, collect_failed_rows, **kwargs):
@@ -590,10 +597,10 @@ class Resource(metaclass=DeclarativeMetaclass):
         if using_transactions:
             # when transactions are used we want to create/update/delete object
             # as transaction will be rolled back if dry_run is set
-            sp1 = savepoint()
+            sp1 = savepoint(using=self.get_connection_name())
 
         try:
-            with atomic_if_using_transaction(using_transactions):
+            with atomic_if_using_transaction(using_transactions, using=self.get_connection_name()):
                 self.before_import(dataset, using_transactions, dry_run, **kwargs)
         except Exception as e:
             logger.debug(e, exc_info=e)
@@ -611,7 +618,7 @@ class Resource(metaclass=DeclarativeMetaclass):
             result.add_dataset_headers(dataset.headers)
 
         for i, row in enumerate(dataset.dict, 1):
-            with atomic_if_using_transaction(using_transactions):
+            with atomic_if_using_transaction(using_transactions, using=self.get_connection_name()):
                 row_result = self.import_row(
                     row,
                     instance_loader,
@@ -637,7 +644,7 @@ class Resource(metaclass=DeclarativeMetaclass):
                 result.append_row_result(row_result)
 
         try:
-            with atomic_if_using_transaction(using_transactions):
+            with atomic_if_using_transaction(using_transactions, using=self.get_connection_name()):
                 self.after_import(dataset, result, using_transactions, dry_run, **kwargs)
         except Exception as e:
             logger.debug(e, exc_info=e)
@@ -648,9 +655,9 @@ class Resource(metaclass=DeclarativeMetaclass):
 
         if using_transactions:
             if dry_run or result.has_errors():
-                savepoint_rollback(sp1)
+                savepoint_rollback(sp1, using=self.get_connection_name())
             else:
-                savepoint_commit(sp1)
+                savepoint_commit(sp1, using=self.get_connection_name())
 
         return result
 
@@ -912,6 +919,12 @@ class ModelResource(Resource, metaclass=ModelDeclarativeMetaclass):
         """
         return self._meta.model.objects.all()
 
+    def get_connection_name(self):
+        """
+        Returns the right connection for writes so we can perform transactions on it properly.
+        """
+        return router.db_for_write(self._meta.model)
+
     def init_instance(self, row=None):
         """
         Initializes a new Django model.
@@ -924,7 +937,7 @@ class ModelResource(Resource, metaclass=ModelDeclarativeMetaclass):
         """
         # Adapted from django's loaddata
         if not dry_run and any(r.import_type == RowResult.IMPORT_TYPE_NEW for r in result.rows):
-            connection = connections[DEFAULT_DB_ALIAS]
+            connection = connections[self.get_connection_name()]
             sequence_sql = connection.ops.sequence_reset_sql(no_style(), [self._meta.model])
             if sequence_sql:
                 cursor = connection.cursor()
